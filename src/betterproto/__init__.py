@@ -912,7 +912,9 @@ class Message(ABC):
             field_name = safe_snake_case(key)
             meta = self._betterproto.meta_by_field_name.get(field_name)
             if not meta:
-                continue
+                raise ValueError(
+                    f"key '{key}' has no meta data in proto {self.__class__} "
+                )
 
             if value[key] is not None:
                 if meta.proto_type == "message":
