@@ -2,7 +2,7 @@ from betterproto import casing
 
 
 def pythonize_class_name(name):
-    return casing.pascal_case(name)
+    return casing.pascal_case(name).replace(".", "")
 
 
 def pythonize_field_name(name: str):
