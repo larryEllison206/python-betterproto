@@ -747,7 +747,7 @@ class Message(ABC):
             meta.group is not None and self._group_current.get(meta.group) == field_name
         )
 
-    def parse(self: T, data: bytes) -> T:
+    def parse(self: T, data: bytes, strip=True) -> T:
         """
         Parse the binary encoded Protobuf into this message instance. This
         returns the instance itself and is therefore assignable and chainable.
@@ -794,6 +794,8 @@ class Message(ABC):
             elif isinstance(current, list) and not isinstance(value, list):
                 current.append(value)
             else:
+                if meta.proto_type in (TYPE_BYTES, TYPE_STRING) and strip:
+                    value = value.strip()
                 setattr(self, field_name, value)
 
         return self
