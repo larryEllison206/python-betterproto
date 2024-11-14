@@ -4,7 +4,7 @@ import inspect
 import json
 import struct
 import sys
-import warnings
+import typing
 from abc import ABC
 from base64 import b64decode, b64encode
 from datetime import datetime, timedelta, timezone
@@ -22,13 +22,11 @@ from typing import (
     get_type_hints,
 )
 
-import typing
-
 from ._types import T
 from .casing import camel_case, safe_snake_case, snake_case
 from .grpc.grpclib_client import ServiceStub
 
-if not (sys.version_info.major == 3 and sys.version_info.minor >= 7):
+if sys.version_info[:2] < (3, 7):
     # Apply backport of datetime.fromisoformat from 3.7
     from backports.datetime_fromisoformat import MonkeyPatch
 
@@ -112,7 +110,7 @@ WIRE_LEN_DELIM_TYPES = [TYPE_STRING, TYPE_BYTES, TYPE_MESSAGE, TYPE_MAP]
 
 
 # Protobuf datetimes start at the Unix Epoch in 1970 in UTC.
-def datetime_default_gen():
+def datetime_default_gen() -> datetime:
     return datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
@@ -122,15 +120,11 @@ DATETIME_ZERO = datetime_default_gen()
 class Casing(enum.Enum):
     """Casing constants for serialization."""
 
-    CAMEL = camel_case
-    SNAKE = snake_case
+    CAMEL = camel_case  #: A camelCase sterilization function.
+    SNAKE = snake_case  #: A snake_case sterilization function.
 
 
-class _PLACEHOLDER:
-    pass
-
-
-PLACEHOLDER: Any = _PLACEHOLDER()
+PLACEHOLDER: Any = object()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -255,13 +249,27 @@ def map_field(
 
 
 class Enum(enum.IntEnum):
-    """Protocol buffers enumeration base class. Acts like `enum.IntEnum`."""
+    """
+    The base class for protobuf enumerations, all generated enumerations will inherit
+    from this. Bases :class:`enum.IntEnum`.
+    """
 
     @classmethod
-    def from_string(cls, name: str) -> int:
-        """Return the value which corresponds to the string name."""
+    def from_string(cls, name: str) -> "Enum":
+        """Return the value which corresponds to the string name.
+
+        Parameters
+        -----------
+        name: :class:`str`
+            The name of the enum member to get
+
+        Raises
+        -------
+        :exc:`ValueError`
+            The member was not found in the Enum.
+        """
         try:
-            return cls.__members__[name]
+            return cls._member_map_[name]
         except KeyError as e:
             raise ValueError(f"Unknown value {name} for enum {cls.__name__}") from e
 
@@ -307,11 +315,7 @@ def _preprocess_single(proto_type: str, wraps: str, value: Any) -> bytes:
         return encode_varint(value)
     elif proto_type in [TYPE_SINT32, TYPE_SINT64]:
         # Handle zig-zag encoding.
-        if value >= 0:
-            value = value << 1
-        else:
-            value = (value << 1) ^ (~0)
-        return encode_varint(value)
+        return encode_varint(value << 1 if value >= 0 else (value << 1) ^ (~0))
     elif proto_type in FIXED_TYPES:
         return struct.pack(_pack_fmt(proto_type), value)
     elif proto_type == TYPE_STRING:
@@ -349,7 +353,7 @@ def _serialize_single(
     """Serializes a single field and value."""
     value = _preprocess_single(proto_type, wraps, value)
 
-    output = b""
+    output = bytearray()
     if proto_type in WIRE_VARINT_TYPES:
         key = encode_varint(field_number << 3)
         output += key + value
@@ -366,10 +370,10 @@ def _serialize_single(
     else:
         raise NotImplementedError(proto_type)
 
-    return output
+    return bytes(output)
 
 
-def decode_varint(buffer: bytes, pos: int, signed: bool = False) -> Tuple[int, int]:
+def decode_varint(buffer: bytes, pos: int) -> Tuple[int, int]:
     """
     Decode a single varint value from a byte buffer. Returns the value and the
     new position in the buffer.
@@ -404,15 +408,15 @@ def parse_fields(value: bytes) -> Generator[ParsedField, None, None]:
         wire_type = num_wire & 0x7
 
         decoded: Any = None
-        if wire_type == 0:
+        if wire_type == WIRE_VARINT:
             decoded, i = decode_varint(value, i)
-        elif wire_type == 1:
+        elif wire_type == WIRE_FIXED_64:
             decoded, i = value[i : i + 8], i + 8
-        elif wire_type == 2:
+        elif wire_type == WIRE_LEN_DELIM:
             length, i = decode_varint(value, i)
             decoded = value[i : i + length]
             i += length
-        elif wire_type == 5:
+        elif wire_type == WIRE_FIXED_32:
             decoded, i = value[i : i + 4], i + 4
 
         yield ParsedField(
@@ -421,12 +425,6 @@ def parse_fields(value: bytes) -> Generator[ParsedField, None, None]:
 
 
 class ProtoClassMetadata:
-    oneof_group_by_field: Dict[str, str]
-    oneof_field_by_group: Dict[str, Set[dataclasses.Field]]
-    default_gen: Dict[str, Callable]
-    cls_by_field: Dict[str, Type]
-    field_name_by_number: Dict[int, str]
-    meta_by_field_name: Dict[str, FieldMetadata]
     __slots__ = (
         "oneof_group_by_field",
         "oneof_field_by_group",
@@ -434,7 +432,16 @@ class ProtoClassMetadata:
         "cls_by_field",
         "field_name_by_number",
         "meta_by_field_name",
+        "sorted_field_names",
     )
+
+    oneof_group_by_field: Dict[str, str]
+    oneof_field_by_group: Dict[str, Set[dataclasses.Field]]
+    field_name_by_number: Dict[int, str]
+    meta_by_field_name: Dict[str, FieldMetadata]
+    sorted_field_names: Tuple[str, ...]
+    default_gen: Dict[str, Callable[[], Any]]
+    cls_by_field: Dict[str, Type]
 
     def __init__(self, cls: Type["Message"]):
         by_field = {}
@@ -459,21 +466,22 @@ class ProtoClassMetadata:
         self.oneof_field_by_group = by_group
         self.field_name_by_number = by_field_number
         self.meta_by_field_name = by_field_name
-
+        self.sorted_field_names = tuple(
+            by_field_number[number] for number in sorted(by_field_number)
+        )
         self.default_gen = self._get_default_gen(cls, fields)
         self.cls_by_field = self._get_cls_by_field(cls, fields)
 
     @staticmethod
-    def _get_default_gen(cls, fields):
-        default_gen = {}
-
-        for field in fields:
-            default_gen[field.name] = cls._get_field_default_gen(field)
-
-        return default_gen
+    def _get_default_gen(
+        cls: Type["Message"], fields: List[dataclasses.Field]
+    ) -> Dict[str, Callable[[], Any]]:
+        return {field.name: cls._get_field_default_gen(field) for field in fields}
 
     @staticmethod
-    def _get_cls_by_field(cls, fields):
+    def _get_cls_by_field(
+        cls: Type["Message"], fields: List[dataclasses.Field]
+    ) -> Dict[str, Type]:
         field_cls = {}
 
         for field in fields:
@@ -490,7 +498,7 @@ class ProtoClassMetadata:
                     ],
                     bases=(Message,),
                 )
-                field_cls[field.name + ".value"] = vt
+                field_cls[f"{field.name}.value"] = vt
             else:
                 field_cls[field.name] = cls._cls_for(field)
 
@@ -499,9 +507,15 @@ class ProtoClassMetadata:
 
 class Message(ABC):
     """
-    A protobuf message base class. Generated code will inherit from this and
-    register the message fields which get used by the serializers and parsers
-    to go between Python, binary and JSON protobuf message representations.
+    The base class for protobuf messages, all generated messages will inherit from
+    this. This class registers the message fields which are used by the serializers and
+    parsers to go between the Python, binary and JSON representations of the message.
+
+    .. container:: operations
+
+        .. describe:: bytes(x)
+
+            Calls :meth:`__bytes__`.
     """
 
     _serialized_on_wire: bool
@@ -513,28 +527,68 @@ class Message(ABC):
         all_sentinel = True
 
         # Set current field of each group after `__init__` has already been run.
-        group_current: Dict[str, str] = {}
+        group_current: Dict[str, Optional[str]] = {}
         for field_name, meta in self._betterproto.meta_by_field_name.items():
 
             if meta.group:
                 group_current.setdefault(meta.group)
 
-            if getattr(self, field_name) != PLACEHOLDER:
-                # Skip anything not set to the sentinel value
+            if self.__raw_get(field_name) != PLACEHOLDER:
+                # Found a non-sentinel value
                 all_sentinel = False
 
                 if meta.group:
                     # This was set, so make it the selected value of the one-of.
                     group_current[meta.group] = field_name
 
-                continue
-
-            setattr(self, field_name, self._get_field_default(field_name))
-
         # Now that all the defaults are set, reset it!
         self.__dict__["_serialized_on_wire"] = not all_sentinel
         self.__dict__["_unknown_fields"] = b""
         self.__dict__["_group_current"] = group_current
+
+    def __raw_get(self, name: str) -> Any:
+        return super().__getattribute__(name)
+
+    def __eq__(self, other) -> bool:
+        if type(self) is not type(other):
+            return False
+
+        for field_name in self._betterproto.meta_by_field_name:
+            self_val = self.__raw_get(field_name)
+            other_val = other.__raw_get(field_name)
+            if self_val is PLACEHOLDER:
+                if other_val is PLACEHOLDER:
+                    continue
+                self_val = self._get_field_default(field_name)
+            elif other_val is PLACEHOLDER:
+                other_val = other._get_field_default(field_name)
+
+            if self_val != other_val:
+                return False
+
+        return True
+
+    def __repr__(self) -> str:
+        parts = [
+            f"{field_name}={value!r}"
+            for field_name in self._betterproto.sorted_field_names
+            for value in (self.__raw_get(field_name),)
+            if value is not PLACEHOLDER
+        ]
+        return f"{self.__class__.__name__}({', '.join(parts)})"
+
+    def __getattribute__(self, name: str) -> Any:
+        """
+        Lazily initialize default values to avoid infinite recursion for recursive
+        message types
+        """
+        value = super().__getattribute__(name)
+        if value is not PLACEHOLDER:
+            return value
+
+        value = self._get_field_default(name)
+        super().__setattr__(name, value)
+        return value
 
     def __setattr__(self, attr: str, value: Any) -> None:
         if attr != "_serialized_on_wire":
@@ -548,14 +602,12 @@ class Message(ABC):
                     if field.name == attr:
                         self._group_current[group] = field.name
                     else:
-                        super().__setattr__(
-                            field.name, self._get_field_default(field.name),
-                        )
+                        super().__setattr__(field.name, PLACEHOLDER)
 
         super().__setattr__(attr, value)
 
     @property
-    def _betterproto(self):
+    def _betterproto(self) -> ProtoClassMetadata:
         """
         Lazy initialize metadata for each protobuf class.
         It may be initialized multiple times in a multi-threaded environment,
@@ -569,9 +621,9 @@ class Message(ABC):
 
     def __bytes__(self) -> bytes:
         """
-        Get the binary encoded Protobuf representation of this instance.
+        Get the binary encoded Protobuf representation of this message instance.
         """
-        output = b""
+        output = bytearray()
         for field_name, meta in self._betterproto.meta_by_field_name.items():
             value = getattr(self, field_name)
 
@@ -609,7 +661,7 @@ class Message(ABC):
                     # Packed lists look like a length-delimited field. First,
                     # preprocess/encode each value into a buffer and then
                     # treat it like a field of raw bytes.
-                    buf = b""
+                    buf = bytearray()
                     for item in value:
                         buf += _preprocess_single(meta.proto_type, "", item)
                     output += _serialize_single(meta.number, TYPE_BYTES, buf)
@@ -644,10 +696,24 @@ class Message(ABC):
                     wraps=meta.wraps or "",
                 )
 
-        return output + self._unknown_fields
+        output += self._unknown_fields
+        return bytes(output)
 
     # For compatibility with other libraries
-    SerializeToString = __bytes__
+    def SerializeToString(self: T) -> bytes:
+        """
+        Get the binary encoded Protobuf representation of this message instance.
+
+        .. note::
+            This is a method for compatibility with other libraries,
+            you should really use ``bytes(x)``.
+
+        Returns
+        --------
+        :class:`bytes`
+            The binary encoded Protobuf representation of this message instance
+        """
+        return bytes(self)
 
     @classmethod
     def _type_hint(cls, field_name: str) -> Type:
@@ -655,9 +721,8 @@ class Message(ABC):
 
     @classmethod
     def _type_hints(cls) -> Dict[str, Type]:
-        module = inspect.getmodule(cls)
-        type_hints = get_type_hints(cls, vars(module))
-        return type_hints
+        module = sys.modules[cls.__module__]
+        return get_type_hints(cls, vars(module))
 
     @classmethod
     def _cls_for(cls, field: dataclasses.Field, index: int = 0) -> Type:
@@ -668,7 +733,7 @@ class Message(ABC):
                 field_cls = field_cls.__args__[index]
         return field_cls
 
-    def _get_field_default(self, field_name):
+    def _get_field_default(self, field_name: str) -> Any:
         return self._betterproto.default_gen[field_name]()
 
     @classmethod
@@ -691,7 +756,7 @@ class Message(ABC):
         elif issubclass(t, Enum):
             # Enums always default to zero.
             return int
-        elif t == datetime:
+        elif t is datetime:
             # Offsets are relative to 1970-01-01T00:00:00Z
             return datetime_default_gen
         else:
@@ -751,17 +816,27 @@ class Message(ABC):
         """
         Parse the binary encoded Protobuf into this message instance. This
         returns the instance itself and is therefore assignable and chainable.
+
+        Parameters
+        -----------
+        data: :class:`bytes`
+            The data to parse the protobuf from.
+
+        Returns
+        --------
+        :class:`Message`
+            The initialized message.
         """
         # Got some data over the wire
         self._serialized_on_wire = True
-
+        proto_meta = self._betterproto
         for parsed in parse_fields(data):
-            field_name = self._betterproto.field_name_by_number.get(parsed.number)
+            field_name = proto_meta.field_name_by_number.get(parsed.number)
             if not field_name:
                 self._unknown_fields += parsed.raw
                 continue
 
-            meta = self._betterproto.meta_by_field_name[field_name]
+            meta = proto_meta.meta_by_field_name[field_name]
 
             value: Any
             if parsed.wire_type == WIRE_LEN_DELIM and meta.proto_type in PACKED_TYPES:
@@ -803,26 +878,53 @@ class Message(ABC):
     # For compatibility with other libraries.
     @classmethod
     def FromString(cls: Type[T], data: bytes) -> T:
+        """
+        Parse the binary encoded Protobuf into this message instance. This
+        returns the instance itself and is therefore assignable and chainable.
+
+        .. note::
+            This is a method for compatibility with other libraries,
+            you should really use :meth:`parse`.
+
+
+        Parameters
+        -----------
+        data: :class:`bytes`
+            The data to parse the protobuf from.
+
+        Returns
+        --------
+        :class:`Message`
+            The initialized message.
+        """
         return cls().parse(data)
 
     def to_dict(
         self, casing: Casing = Casing.CAMEL, include_default_values: bool = False
     ) -> Dict[str, Any]:
         """
-        Returns a dict representation of this message instance which can be
-        used to serialize to e.g. JSON. Defaults to camel casing for
-        compatibility but can be set to other modes.
+        Returns a JSON serializable dict representation of this object.
 
-        `include_default_values` can be set to `True` to include default
-        values of fields. E.g. an `int32` type field with `0` value will
-        not be in returned dict if `include_default_values` is set to
-        `False`.
+        Parameters
+        -----------
+        casing: :class:`Casing`
+            The casing to use for key values. Default is :attr:`Casing.CAMEL` for
+            compatibility purposes.
+        include_default_values: :class:`bool`
+            If ``True`` will include the default values of fields. Default is ``False``.
+            E.g. an ``int32`` field will be included with a value of ``0`` if this is
+            set to ``True``, otherwise this would be ignored.
+
+        Returns
+        --------
+        Dict[:class:`str`, Any]
+            The JSON serializable dict representation of this object.
         """
         output: Dict[str, Any] = {}
         field_types = self._type_hints()
+        defaults = self._betterproto.default_gen
         for field_name, meta in self._betterproto.meta_by_field_name.items():
-            field_type = field_types[field_name]
-            field_is_repeated = type(field_type) is type(typing.List)
+            field_is_repeated = defaults[field_name] is list
             value = getattr(self, field_name)
             cased_name = casing(field_name).rstrip("_")  # type: ignore
             if meta.proto_type == TYPE_MESSAGE:
@@ -859,8 +961,8 @@ class Message(ABC):
                         field_name=field_name, meta=meta
                     )
                 ):
-                    output[cased_name] = value.to_dict(casing, include_default_values,)
-            elif meta.proto_type == "map":
+                    output[cased_name] = value.to_dict(casing, include_default_values)
+            elif meta.proto_type == TYPE_MAP:
                 for k in value:
                     if hasattr(value[k], "to_dict"):
                         value[k] = value[k].to_dict(casing, include_default_values)
@@ -888,7 +990,7 @@ class Message(ABC):
                         output[cased_name] = b64encode(value).decode("utf8")
                 elif meta.proto_type == TYPE_ENUM:
                     if field_is_repeated:
-                        enum_class: Type[Enum] = field_type.__args__[0]
+                        enum_class: Type[Enum] = field_types[field_name].__args__[0]
                         if isinstance(value, typing.Iterable) and not isinstance(
                             value, str
                         ):
@@ -897,19 +999,28 @@ class Message(ABC):
                             # transparently upgrade single value to repeated
                             output[cased_name] = [enum_class(value).name]
                     else:
-                        enum_class: Type[Enum] = field_type  # noqa
+                        enum_class: Type[Enum] = field_types[field_name]  # noqa
                         output[cased_name] = enum_class(value).name
                 else:
                     output[cased_name] = value
         return output
 
-    def from_dict(self: T, value: dict) -> T:
+    def from_dict(self: T, value: Dict[str, Any]) -> T:
         """
-        Parse the key/value pairs in `value` into this message instance. This
-        returns the instance itself and is therefore assignable and chainable.
+        Parse the key/value pairs into the current message instance. This returns the
+        instance itself and is therefore assignable and chainable.
+
+        Parameters
+        -----------
+        value: Dict[:class:`str`, Any]
+            The dictionary to parse from.
+
+        Returns
+        --------
+        :class:`Message`
+            The initialized message.
         """
         self._serialized_on_wire = True
-        fields_by_name = {f.name: f for f in dataclasses.fields(self)}
         for key in value:
             field_name = safe_snake_case(key)
             meta = self._betterproto.meta_by_field_name.get(field_name)
@@ -919,12 +1030,12 @@ class Message(ABC):
                 )
 
             if value[key] is not None:
-                if meta.proto_type == "message":
+                if meta.proto_type == TYPE_MESSAGE:
                     v = getattr(self, field_name)
                     if isinstance(v, list):
                         cls = self._betterproto.cls_by_field[field_name]
-                        for i in range(len(value[key])):
-                            v.append(cls().from_dict(value[key][i]))
+                        for item in value[key]:
+                            v.append(cls().from_dict(item))
                     elif isinstance(v, datetime):
                         v = datetime.fromisoformat(value[key].replace("Z", "+00:00"))
                         setattr(self, field_name, v)
@@ -939,7 +1050,7 @@ class Message(ABC):
                         v.from_dict(value[key])
                 elif meta.map_types and meta.map_types[1] == TYPE_MESSAGE:
                     v = getattr(self, field_name)
-                    cls = self._betterproto.cls_by_field[field_name + ".value"]
+                    cls = self._betterproto.cls_by_field[f"{field_name}.value"]
                     for k in value[key]:
                         v[k] = cls().from_dict(value[key][k])
                 else:
@@ -966,45 +1077,87 @@ class Message(ABC):
         return self
 
     def to_json(self, indent: Union[None, int, str] = None) -> str:
-        """Returns the encoded JSON representation of this message instance."""
+        """A helper function to parse the message instance into its JSON
+        representation.
+
+        This is equivalent to::
+
+            json.dumps(message.to_dict(), indent=indent)
+
+        Parameters
+        -----------
+        indent: Optional[Union[:class:`int`, :class:`str`]]
+            The indent to pass to :func:`json.dumps`.
+
+        Returns
+        --------
+        :class:`str`
+            The JSON representation of the message.
+        """
         return json.dumps(self.to_dict(), indent=indent)
 
     def from_json(self: T, value: Union[str, bytes]) -> T:
-        """
-        Parse the key/value pairs in `value` into this message instance. This
-        returns the instance itself and is therefore assignable and chainable.
+        """A helper function to return the message instance from its JSON
+        representation. This returns the instance itself and is therefore assignable
+        and chainable.
+
+        This is equivalent to::
+
+            return message.from_dict(json.loads(value))
+
+        Parameters
+        -----------
+        value: Union[:class:`str`, :class:`bytes`]
+            The value to pass to :func:`json.loads`.
+
+        Returns
+        --------
+        :class:`Message`
+            The initialized message.
         """
         return self.from_dict(json.loads(value))
 
 
 def serialized_on_wire(message: Message) -> bool:
     """
-    True if this message was or should be serialized on the wire. This can
-    be used to detect presence (e.g. optional wrapper message) and is used
-    internally during parsing/serialization.
+    If this message was or should be serialized on the wire. This can be used to detect
+    presence (e.g. optional wrapper message) and is used internally during
+    parsing/serialization.
+
+    Returns
+    --------
+    :class:`bool`
+        Whether this message was or should be serialized on the wire.
     """
     return message._serialized_on_wire
 
 
-def which_one_of(message: Message, group_name: str) -> Tuple[str, Any]:
-    """Return the name and value of a message's one-of field group."""
+def which_one_of(message: Message, group_name: str) -> Tuple[str, Optional[Any]]:
+    """
+    Return the name and value of a message's one-of field group.
+
+    Returns
+    --------
+    Tuple[:class:`str`, Any]
+        The field name and the value for that field.
+    """
     field_name = message._group_current.get(group_name)
     if not field_name:
-        return ("", None)
-    return (field_name, getattr(message, field_name))
+        return "", None
+    return field_name, getattr(message, field_name)
 
 
 # Circular import workaround: google.protobuf depends on base classes defined above.
 from .lib.google.protobuf import (  # noqa
-    Duration,
-    Timestamp,
     BoolValue,
     BytesValue,
     DoubleValue,
+    Duration,
     FloatValue,
     Int32Value,
     Int64Value,
     StringValue,
+    Timestamp,
     UInt32Value,
     UInt64Value,
 )
@@ -1019,8 +1172,8 @@ class _Duration(Duration):
         parts = str(delta.total_seconds()).split(".")
         if len(parts) > 1:
             while len(parts[1]) not in [3, 6, 9]:
-                parts[1] = parts[1] + "0"
-        return ".".join(parts) + "s"
+                parts[1] = f"{parts[1]}0"
+        return f"{'.'.join(parts)}s"
 
 
 class _Timestamp(Timestamp):
@@ -1036,15 +1189,15 @@ class _Timestamp(Timestamp):
         if (nanos % 1e9) == 0:
             # If there are 0 fractional digits, the fractional
             # point '.' should be omitted when serializing.
-            return result + "Z"
+            return f"{result}Z"
         if (nanos % 1e6) == 0:
             # Serialize 3 fractional digits.
-            return result + ".%03dZ" % (nanos / 1e6)
+            return f"{result}.{int(nanos // 1e6) :03d}Z"
         if (nanos % 1e3) == 0:
             # Serialize 6 fractional digits.
-            return result + ".%06dZ" % (nanos / 1e3)
+            return f"{result}.{int(nanos // 1e3) :06d}Z"
         # Serialize 9 fractional digits.
-        return result + ".%09dZ" % nanos
+        return f"{result}.{nanos:09d}"
 
 
 class _WrappedMessage(Message):

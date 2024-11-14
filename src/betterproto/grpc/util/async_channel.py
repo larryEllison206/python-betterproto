@@ -1,12 +1,5 @@
 import asyncio
-from typing import (
-    AsyncIterable,
-    AsyncIterator,
-    Iterable,
-    Optional,
-    TypeVar,
-    Union,
-)
+from typing import AsyncIterable, AsyncIterator, Iterable, Optional, TypeVar, Union
 
 T = TypeVar("T")
 
@@ -16,16 +9,12 @@ class ChannelClosed(Exception):
     An exception raised on an attempt to send through a closed channel
     """
 
-    pass
-
 
 class ChannelDone(Exception):
     """
     An exception raised on an attempt to send receive from a channel that is both closed
     and empty.
     """
-
-    pass
 
 
 class AsyncChannel(AsyncIterable[T]):
@@ -80,9 +69,7 @@ class AsyncChannel(AsyncIterable[T]):
         or immediately if no source is provided.
     """
 
-    def __init__(
-        self, *, buffer_limit: int = 0, close: bool = False,
-    ):
+    def __init__(self, *, buffer_limit: int = 0, close: bool = False):
         self._queue: asyncio.Queue[Union[T, object]] = asyncio.Queue(buffer_limit)
         self._closed = False
         self._waiting_receivers: int = 0
