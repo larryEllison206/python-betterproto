@@ -93,7 +93,7 @@ def reference_sibling(py_type: str) -> str:
     """
     Returns a reference to a python type within the same package as the current package.
     """
-    return f'"{py_type}"'
+    return py_type
 
 
 def reference_descendent(
