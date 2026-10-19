@@ -1,9 +1,11 @@
 import os.path
+import subprocess
+import sys
 
 try:
     # betterproto[compiler] specific dependencies
-    import black
     import jinja2
+    import ruff
 except ImportError as err:
     print(
         "\033[31m"
@@ -31,7 +33,10 @@ def outputfile_compiler(output_file: OutputTemplate) -> str:
     )
     template = env.get_template("template.py.j2")
 
-    return black.format_str(
-        template.render(output_file=output_file),
-        mode=black.FileMode(target_versions={black.TargetVersion.PY37}),
-    )
+    return subprocess.run(
+        [sys.executable, "-m", "ruff", "format", "--isolated", "--target-version", "py37", "-"],
+        input=template.render(output_file=output_file),
+        stdout=subprocess.PIPE,
+        encoding="utf-8",
+        check=True,
+    ).stdout

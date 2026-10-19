@@ -41,7 +41,7 @@ This project is a reimplementation from the ground up focused on idiomatic moder
 
 ## Installation
 
-First, install the package. Note that the `[compiler]` feature flag tells it to install extra dependencies only needed by the `protoc` plugin:
+First, install the package. Note that the `[compiler]` feature flag tells it to install extra dependencies only needed by the `protoc` plugin. The compiler requires Python 3.7+ and formats generated Python code with [Ruff](https://docs.astral.sh/ruff/formatter/):
 
 ```sh
 # Install both the library and compiler
